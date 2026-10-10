@@ -10,11 +10,34 @@ git clone https://github.com/adbrasi/comfyui-anima-consistency
 Reinicie o ComfyUI. Os nodes aparecem em **anima/consistency**. Funciona com o Anima nativo do ComfyUI
 (`Load Diffusion Model` → anima-base/aesthetic); não precisa de dependências extras.
 
+## Fluxo recomendado (consistência de cena / paleta, sem máscara)
+
+```
+Load Diffusion Model ─► Anima Shared Attention (SPDA) ─► Anima Palette Lock ─► KSampler.model
+Load CLIP ─► Anima Batch Prompts ─ positive ─► KSampler.positive
+                                 ─ negative ─► KSampler.negative
+                                 ─ latent   ─► KSampler.latent_image   (NÃO use Empty Latent Image)
+KSampler ─► VAE Decode ─► Save Image   (sai uma imagem por linha de prompt)
+```
+
+- `prefix`: o que deve ser igual em todas (personagem, **ambiente**, estilo, iluminação).
+- `prompts`: uma linha por imagem (ação/enquadramento).
+- SPDA com `anchors = 1`: todas as imagens "olham" para a imagem 0 como um painel ao lado → mesmo ambiente/tema.
+  `anchors = 0`: todas com todas (puxa para um visual médio do grupo).
+- Palette Lock: alinha média/desvio por canal do latente previsto à imagem 0 nos passos iniciais → mesma paleta e tom.
+
 ## Nodes
 
 ### Anima Batch Prompts
-Um prompt por imagem do batch: `prefix` (personagem + qualidade, compartilhado) + uma linha por imagem.
-Saídas: `conditioning` (batch) e `batch_size` → ligue em `Empty Latent Image (batch_size)`.
+Um prompt por imagem do batch: `prefix` (compartilhado) + uma linha por imagem.
+Saídas: `positive`, `negative` (batch), `latent` (vazio, já com batch = nº de linhas, `width`×`height`) e `batch_size`.
+Com batch 1 o ComfyUI descarta silenciosamente todos os prompts menos o primeiro e o SPDA fica desligado —
+por isso o node entrega o latente pronto.
+
+### Anima Palette Lock
+Patch do MODEL (função pós-CFG). Enquanto σ ≥ `until_sigma`, puxa estatísticas globais por canal (média/desvio)
+do x0 previsto de cada imagem para as da referência (`first image` ou `batch average`), com peso `strength`.
+Afeta cor, tom e luz globais; não copia conteúdo nem layout. Ponto de partida: strength 0.6, until_sigma 0.5.
 
 ### Anima Shared Attention (SPDA)
 Patch do MODEL. Cada imagem do batch também "olha" para as outras como se fossem **painéis ao lado**

@@ -6,7 +6,7 @@ AnimaSharedAttention   – "Side-Panel Decoupled Attention" (SPDA): every image 
                          to its right (RoPE width shift), blended with weight lambda, in mid blocks only.
 See https://github.com/adbrasi/anima-consistency-lab for the research behind the defaults.
 """
-import math
+import logging
 import torch
 import torch.nn.functional as F
 import comfy.model_management as mm
@@ -66,6 +66,9 @@ class SPDA:
         to = kwargs.get("transformer_options", {})
         sig = to.get("sigmas", None)
         self.state["sigma"] = float(sig.max()) if sig is not None else 1.0
+        if not self.state.get("logged") and x.shape[0] > 1:
+            self.state["logged"] = True
+            logging.info(f"[Anima SPDA] active: latent batch {x.shape[0]}, blocks {min(self.blocks)}-{max(self.blocks)}, strength {self.lam}")
         return executor(x, timesteps, context, *args, **kwargs)
 
     def attention(self, func, q, k, v, heads, *args, **kwargs):
@@ -80,6 +83,10 @@ class SPDA:
         nch = max(1, len(cou))
         n = B // nch
         if n < 2:
+            if not self.state.get("warned"):
+                self.state["warned"] = True
+                logging.warning("[Anima SPDA] batch has 1 image -> shared attention is OFF. Use the `latent` output of "
+                                "Anima Batch Prompts (one image per prompt line) as the KSampler latent.")
             return func(q, k, v, heads, *args, **kwargs)
         W, wf = self.state["W"], self.state["wf"]
         if self.anchor_mask is not None:
@@ -160,37 +167,105 @@ class AnimaSharedAttention:
         return (m,)
 
 
+class PaletteLock:
+    """post-CFG: pulls per-channel mean/std of every image's predicted clean latent toward a reference
+    (image 0, or the batch average) while sigma >= until_sigma. Global color/tone/lighting become shared;
+    content and layout stay free (no mask, nothing is copied)."""
+    def __init__(self, strength, until_sigma, source):
+        self.strength, self.until_sigma, self.source = strength, until_sigma, source
+
+    def __call__(self, args):
+        x0 = args["denoised"]
+        sig = float(args["sigma"].max())
+        if self.strength <= 0 or x0.shape[0] < 2 or sig < self.until_sigma:
+            return x0
+        dims = tuple(range(2, x0.ndim))
+        mu = x0.mean(dims, keepdim=True)
+        sd = x0.std(dims, keepdim=True) + 1e-6
+        if self.source == "first image":
+            mu_r, sd_r = mu[:1], sd[:1]
+        else:
+            mu_r, sd_r = mu.mean(0, keepdim=True), sd.mean(0, keepdim=True)
+        aligned = (x0 - mu) / sd * sd_r + mu_r
+        out = x0 + self.strength * (aligned - x0)
+        if self.source == "first image":
+            out[:1] = x0[:1]
+        return out
+
+
+class AnimaPaletteLock:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "model": ("MODEL",),
+            "strength": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.0, "step": 0.05,
+                                   "tooltip": "how strongly every image takes the color palette / tone / lighting of the reference"}),
+            "until_sigma": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05,
+                                      "tooltip": "applied while sigma >= this (early steps decide palette). 0 = every step (flatter)"}),
+            "source": (["first image", "batch average"], {"default": "first image"}),
+        }}
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "patch"
+    CATEGORY = "anima/consistency"
+
+    def patch(self, model, strength, until_sigma, source):
+        m = model.clone()
+        m.set_model_sampler_post_cfg_function(PaletteLock(strength, until_sigma, source))
+        return (m,)
+
+
 class AnimaBatchPrompts:
-    """Encode one prompt per image: `prefix` + each non-empty line of `prompts`. Output batch conditioning."""
+    """One prompt per image: `prefix` + each non-empty line of `prompts`.
+    Outputs positive/negative batch conditioning AND the matching empty latent (one image per line), so the
+    batch size can never be out of sync (with batch 1 ComfyUI silently keeps only the first prompt)."""
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {
             "clip": ("CLIP",),
             "model": ("MODEL",),
-            "prefix": ("STRING", {"multiline": True, "default": "masterpiece, best quality, safe, 1girl, solo, "}),
-            "prompts": ("STRING", {"multiline": True, "default": "upper body, smile\nfull body, running, city street"}),
+            "prefix": ("STRING", {"multiline": True, "default": "masterpiece, best quality, safe, 1girl, solo, ",
+                                  "tooltip": "shared by every image: character description + quality tags"}),
+            "prompts": ("STRING", {"multiline": True, "default": "upper body, smile\nfull body, running, city street",
+                                   "tooltip": "ONE LINE PER IMAGE (empty lines are ignored)"}),
+            "negative": ("STRING", {"multiline": True, "default": "worst quality, low quality, score_1, score_2, score_3, blurry, jpeg artifacts, sepia"}),
+            "width": ("INT", {"default": 1024, "min": 256, "max": 4096, "step": 16}),
+            "height": ("INT", {"default": 1024, "min": 256, "max": 4096, "step": 16}),
         }}
 
-    RETURN_TYPES = ("CONDITIONING", "INT")
-    RETURN_NAMES = ("conditioning", "batch_size")
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "LATENT", "INT")
+    RETURN_NAMES = ("positive", "negative", "latent", "batch_size")
     FUNCTION = "encode"
     CATEGORY = "anima/consistency"
 
-    def encode(self, clip, model, prefix, prompts):
+    def encode(self, clip, model, prefix, prompts, negative, width, height):
         lines = [l.strip() for l in prompts.splitlines() if l.strip()]
-        mm.load_models_gpu([model])
+        if not lines:
+            raise ValueError("Anima Batch Prompts: `prompts` is empty - write one prompt per line.")
         dm = model.model.diffusion_model
-        dev = mm.get_torch_device()
+        if not hasattr(dm, "preprocess_text_embeds"):
+            raise ValueError("Anima Batch Prompts: the MODEL is not an Anima model.")
+        texts = [prefix + l for l in lines]
+        raw = [clip.encode_from_tokens(clip.tokenize(t), return_dict=True) for t in texts + [negative]]
+        mm.load_models_gpu([model])
+        dev = model.load_device
         dt = model.model.get_dtype_inference() if hasattr(model.model, "get_dtype_inference") else torch.bfloat16
         ctxs = []
         with torch.no_grad():
-            for l in lines:
-                out = clip.encode_from_tokens(clip.tokenize(prefix + l), return_dict=True)
+            for out in raw:
                 ids = out["t5xxl_ids"].unsqueeze(0).to(dev)
                 w = out["t5xxl_weights"].unsqueeze(0).unsqueeze(-1).to(dev, dt)
-                ctxs.append(dm.preprocess_text_embeds(out["cond"].to(dev, dt), ids, t5xxl_weights=w).cpu())
-        return ([[torch.cat(ctxs), {}]], len(lines))
+                ctxs.append(dm.preprocess_text_embeds(out["cond"].to(dev, dt), ids, t5xxl_weights=w).float().cpu())
+        L = max(c.shape[1] for c in ctxs)
+        ctxs = [F.pad(c, (0, 0, 0, L - c.shape[1])) for c in ctxs]
+        n = len(lines)
+        pos = torch.cat(ctxs[:n])
+        neg = ctxs[n].repeat(n, 1, 1)
+        latent = torch.zeros([n, 16, 1, height // 8, width // 8], device=mm.intermediate_device())
+        for i, t in enumerate(texts):
+            logging.info(f"[Anima Batch Prompts] image {i}: {t}")
+        return ([[pos, {}]], [[neg, {}]], {"samples": latent}, n)
 
 
-NODE_CLASS_MAPPINGS = {"AnimaSharedAttention": AnimaSharedAttention, "AnimaBatchPrompts": AnimaBatchPrompts}
-NODE_DISPLAY_NAME_MAPPINGS = {"AnimaSharedAttention": "Anima Shared Attention (SPDA)", "AnimaBatchPrompts": "Anima Batch Prompts"}
+NODE_CLASS_MAPPINGS = {"AnimaPaletteLock": AnimaPaletteLock, "AnimaSharedAttention": AnimaSharedAttention, "AnimaBatchPrompts": AnimaBatchPrompts}
+NODE_DISPLAY_NAME_MAPPINGS = {"AnimaPaletteLock": "Anima Palette Lock", "AnimaSharedAttention": "Anima Shared Attention (SPDA)", "AnimaBatchPrompts": "Anima Batch Prompts"}
